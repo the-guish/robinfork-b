@@ -86,6 +86,125 @@ was an unacceptable waste of time, and would I please review
 across the repository, and my own session, and say whether the instructions were
 clear or there was a gap.
 
+### What is so special about that testing strategy document the human developer insists on so much?
+
+If you have not read `docs/testing/testing-strategy.md`, it is about sixty lines,
+and here is what it says in plain words.
+
+The backend is built in layers that may only point inward, and the architecture
+rules in `docs/architecture/rules.md` enforce that with a test. The strategy sorts
+tests by *what they prove*, not by how fast they run. Each category answers one
+question, and each behavior is proved in exactly one of them.
+
+```
+                 THE LAYERS                                 THE TEST CATEGORIES
+                 (imports point inward only)                (each behavior proved in exactly one)
+
+   ┌────────────────────────────────┐
+   │ browser: frontend/ (the chat)  │ ◄────────  tests/e2e/      master journeys (the daily paths) and
+   └───────────────┬────────────────┘             special cases; built UI, Chromium, a server, PostgreSQL
+                   │ HTTP
+   ┌───────────────▼────────────────┐
+   │ web/  routes, sign-in, headers,│ ◄────────  tests/api/      a real `robinauts start`, over HTTP, with
+   │       guard, CLI, worker       │             PostgreSQL and a fake model server; only for what the
+   └───────────────┬────────────────┘             UI cannot show, or hardening against defective clients
+                   │
+   ┌───────────────▼────────────────┐
+   │ controller/  application, core,│ ◄────────  tests/unit/     pure functions and stateless logic;
+   │              ports, composition│             needs nothing
+   └───────┬────────────────┬───────┘
+           │                │
+   ┌───────▼───────┐ ┌──────▼────────────────┐
+   │ controller/   │ │ agent_engines/        │ ◄──  tests/adapters_free/    one adapter against its real
+   │ adapters/     │ │ echo, langchain,      │       dependency or a stand-in (PostgreSQL, a local model)
+   │ postgres,     │ │ pydantic_ai           │ ◄──  tests/adapters_metered/ the paid providers; by hand only
+   │ memory        │ │                       │
+   └───────────────┘ └───────────────────────┘
+
+   everything above, in one process, with   ◄──  tests/fast/     an extra layer that overlaps the others on
+   the in-memory store and the echo engine                       purpose: cheap, runs first, catches the
+                                                                 obvious early; never the only test of a behavior
+
+   the repository itself: scripts/, the     ◄──  tests/tooling/  the layer rules above, the licence gate,
+   layer rules, the gates                                        the check scripts
+```
+
+The rules, reduced to what you need when you are about to write a test:
+
+1. **Pick the one placement.** If a person can see the behavior in the interface,
+   it is an e2e test. If the interface cannot show it (a status code, a header, a
+   refusal, what a defective client gets back), it is an API test. If it is a pure
+   function, it is a unit test. If it is one adapter honoring its contract against
+   the real dependency, it is an adapters test. If it checks the repository itself,
+   it is tooling. One category per behavior; overlap between them is kept as small
+   as possible.
+2. **Fast is not a placement.** A fast test runs the same code again, in process,
+   with the in-memory store and the echo engine, and it exists to fail early and
+   cheaply. The document asks for close to 80% coverage from this layer and for its
+   size to stay contained. A behavior still gets its test in one of the other
+   categories; the fast one is an addition.
+3. **Builds run everything but e2e and metered in one pytest run**, with a real
+   PostgreSQL that CI refuses to let skip silently. E2E runs last, in its own job,
+   after the backend tests and the frontend checks pass. Metered never runs in CI.
+4. **The API and e2e suites share one server and one database per run.** A test
+   uses only data it creates. A test that needs its own configuration starts its
+   own server.
+
+Why this matters for a project like Robinauts. The product is conversational
+agents: two engines (LangChain and Pydantic AI) that call tools over MCP, keep
+conversations in PostgreSQL, stream answers to a browser, and sign people in
+through OIDC. Almost everything interesting happens at a seam: a header the server
+emits or does not, a redirect that keeps or loses a cookie, a stream that stalls, a
+stored timestamp that survives a non-UTC server clock, a model provider that
+answers differently today. Those are integration failures, and an in-process test
+with fakes is exactly the kind of test that stays green through them. The project
+is also seventeen days old, has one maintainer, and is written largely by agents,
+so many hands will add tests. Without a decision rule, that produces three
+overlapping suites with three sets of fakes, and every behavior change becomes a
+hunt through all three. "One placement per behavior" keeps the cost of a change
+linear, and the fast layer keeps the feedback loop short without pretending to be
+the proof.
+
+What I read as the intention behind it, in my own words. First, prove behavior
+where it is real: at the outermost layer that can observe it, against real
+dependencies or faithful stand-ins, so that a green suite means the product works
+and not that the mocks agree with each other. Second, one truth in one place: when
+a behavior changes, one test changes, and the suite does not accumulate three
+versions of the same assertion that drift apart. Third, make placement a decision
+rather than a taste, so that a suite written by many people and many agents still
+reads as one suite. And a quieter fourth: keep the most expensive layer, the e2e
+master journeys, boring and stable, by reserving it for the daily paths and sending
+every rare case elsewhere. The thing the whole document guards against is the
+comfortable failure: a fast, green, mocked suite over a product that fails at its
+seams.
+
+How that sits against general practice. The best-known posture is the test pyramid
+(Mike Cohn, 2009): many unit tests at the base, fewer service tests, very few UI
+tests, on the argument that unit tests are fast and isolated and UI tests are slow
+and brittle. This strategy departs from that on purpose. Unit tests are reserved
+for pure logic; the primary contracts are the API and e2e suites. That is closer to
+the "testing trophy" (Kent C. Dodds: "write tests, not too many, mostly
+integration") and to the "honeycomb" that some service teams describe, where the
+integration layer is the wide one and both unit and e2e are thin. The adapters
+categories echo hexagonal architecture: test the core as pure functions, test each
+adapter against the real thing it adapts. In the older vocabulary, this is the
+classical or Detroit school (real collaborators, check state) pushed out to the
+process boundary, rather than the London school (mock every collaborator, check
+interactions).
+
+Every architect weighs the same four things differently: speed of feedback,
+confidence per test, cost of maintenance, and flakiness. The pyramid buys speed and
+isolation and pays in confidence at the seams. This strategy buys confidence per
+behavior and cheap change and pays with a slower suite and a PostgreSQL
+requirement, which the fast layer and CI's enforced database are there to soften.
+Other postures you will meet: consumer-driven contract tests at service
+boundaries, property-based tests for pure cores, snapshot tests for serialized
+output, and the "sociable versus solitary" unit-test distinction. None of them is
+wrong. What is wrong is applying one project's posture to another project that has
+written down a different one. My "keep both" recommendation was pyramid thinking,
+with the in-process test as the base and the real-server test as the expensive top.
+In this repository the base is the real server, and the document says so.
+
 ### The analysis, and the second wrong call
 
 The strategy document answered the whole question in one step. Every behavior gets
