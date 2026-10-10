@@ -1,0 +1,173 @@
+From 63497fbcaf30dfb1794019a064e075198a514eae Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 18:06:09 +0000
+Subject: [PATCH] Test that every HTTP answer carries the security headers
+
+An API test asks the real server for an answer, a redirect, a stream,
+the interface's files and every kind of refusal (the guard's 403s,
+404, 405, 422, a missing static file), and checks each carries the
+Content-Security-Policy, X-Frame-Options, X-Content-Type-Options and
+Referrer-Policy. A fast test runs the same check in process.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WSoiAd58tv7xx9VJhmGiyF
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ backend/tests/api/test_security_headers.py    | 82 +++++++++++++++++++
+ .../tests/fast/test_web_security_headers.py   | 55 +++++++++++++
+ 2 files changed, 137 insertions(+)
+ create mode 100644 backend/tests/api/test_security_headers.py
+ create mode 100644 backend/tests/fast/test_web_security_headers.py
+
+diff --git a/backend/tests/api/test_security_headers.py b/backend/tests/api/test_security_headers.py
+new file mode 100644
+index 0000000..b7de894
+--- /dev/null
++++ b/backend/tests/api/test_security_headers.py
+@@ -0,0 +1,82 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""Every HTTP answer carries the security headers: an answer, a stream, a redirect, the files
++of the interface, and every kind of refusal, the ones the guard gives before any route too.
++
++A browser shows none of them, so they are asserted here and not in ``tests/e2e``.
++"""
++
++from __future__ import annotations
++
++import uuid
++
++import httpx
++import pytest
++
++from util.controller_db import requires_postgres
++
++pytestmark = requires_postgres
++
++SECURITY_HEADERS = {
++    "content-security-policy": (
++        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';"
++        " img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none';"
++        " form-action 'none'; frame-ancestors 'none'"
++    ),
++    "x-frame-options": "DENY",
++    "x-content-type-options": "nosniff",
++    "referrer-policy": "same-origin",
++}
++
++ELSEWHERE = f"/api/conversations/{uuid.uuid4()}"
++
++ASKED = [
++    # what is asked, and the status it is answered with
++    pytest.param("GET", "/api/agents", {}, None, 200, id="an-answer"),
++    pytest.param("GET", "/", {}, None, 307, id="a-redirect"),
++    pytest.param("GET", "/ui/", {}, None, 200, id="the-interface"),
++    pytest.param("GET", "/ui/index.html", {}, None, 200, id="an-interface-file"),
++    pytest.param("GET", "/ui/missing.js", {}, None, 404, id="no-interface-file"),
++    pytest.param("GET", "/api/nowhere", {}, None, 404, id="no-route"),
++    pytest.param("DELETE", "/api/agents", {}, None, 405, id="no-method"),
++    pytest.param("GET", ELSEWHERE, {}, None, 404, id="no-conversation"),
++    pytest.param("POST", "/api/turns", {}, {"text": 1}, 422, id="a-malformed-body"),
++    pytest.param(
++        "GET", "/api/agents", {"host": "robinauts.example.com"}, None, 403, id="a-foreign-host"
++    ),
++    pytest.param(
++        "POST",
++        "/api/turns",
++        {"origin": "https://elsewhere.example.com"},
++        {"agent_id": "pydantic_ai", "text": "hello"},
++        403,
++        id="a-foreign-origin",
++    ),
++    pytest.param(
++        "GET", "/ui/", {"host": "robinauts.example.com"}, None, 403, id="the-interface-refused"
++    ),
++]
++
++
++@pytest.mark.parametrize(("method", "path", "headers", "body", "status"), ASKED)
++def test_every_answer_carries_the_security_headers(
++    api: httpx.Client,
++    method: str,
++    path: str,
++    headers: dict[str, str],
++    body: object,
++    status: int,
++) -> None:
++    answer = api.request(method, path, headers=headers, json=body)
++    assert answer.status_code == status, answer.text
++    assert {name: answer.headers.get(name) for name in SECURITY_HEADERS} == SECURITY_HEADERS
++
++
++def test_a_streamed_turn_carries_the_security_headers(api: httpx.Client) -> None:
++    turn = {"agent_id": "pydantic_ai", "text": "hello"}
++    with api.stream("POST", "/api/turns", json=turn) as answer:
++        assert answer.status_code == 200
++        assert answer.headers["content-type"].startswith("text/event-stream")
++        assert {name: answer.headers.get(name) for name in SECURITY_HEADERS} == SECURITY_HEADERS
++        answer.read()
+diff --git a/backend/tests/fast/test_web_security_headers.py b/backend/tests/fast/test_web_security_headers.py
+new file mode 100644
+index 0000000..61c14af
+--- /dev/null
++++ b/backend/tests/fast/test_web_security_headers.py
+@@ -0,0 +1,55 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""The fast run of tests/api/test_security_headers.py: the headers on an answer, on the
++interface, and on the refusals of the guard, of a route and of the static files."""
++
++from __future__ import annotations
++
++import uuid
++from pathlib import Path
++
++import httpx
++from echo_controller import CONFIG
++
++from robinauts.controller.composition import compose
++from robinauts.controller.contract.domain import StorageConfig, StorageKind
++from robinauts.web.app import create_app
++from util.aio import asyncio_test
++
++SECURITY_HEADERS = {
++    "content-security-policy": (
++        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';"
++        " img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none';"
++        " form-action 'none'; frame-ancestors 'none'"
++    ),
++    "x-frame-options": "DENY",
++    "x-content-type-options": "nosniff",
++    "referrer-policy": "same-origin",
++}
++
++
++@asyncio_test
++async def test_every_answer_carries_the_security_headers(tmp_path: Path) -> None:
++    (tmp_path / "index.html").write_text("<!doctype html><title>Robinauts</title>")
++    composed = compose(CONFIG, storage=StorageConfig(StorageKind.IN_MEMORY), secret_for={}.get)
++    app = create_app(composed, sign_in=None, secret_for={}.get, ui_dir=tmp_path)
++    foreign = {"host": "robinauts.example.com"}
++    asked = [
++        ("GET", "/api/agents", {}, 200),
++        ("GET", "/", {}, 307),
++        ("GET", "/ui/", {}, 200),
++        ("GET", "/ui/missing.js", {}, 404),
++        ("GET", f"/api/conversations/{uuid.uuid4()}", {}, 404),
++        ("DELETE", "/api/agents", {}, 405),
++        ("GET", "/api/agents", foreign, 403),
++        ("GET", "/ui/", foreign, 403),
++    ]
++    async with app.router.lifespan_context(app):
++        transport = httpx.ASGITransport(app=app)
++        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as http:
++            for method, path, headers, status in asked:
++                answer = await http.request(method, path, headers=headers)
++                assert answer.status_code == status, (method, path, answer.text)
++                carried = {name: answer.headers.get(name) for name in SECURITY_HEADERS}
++                assert carried == SECURITY_HEADERS, (method, path)
+-- 
+2.43.0
+

@@ -1,0 +1,114 @@
+From b288a7700ad371f34712af9578ee267602591082 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 18:12:14 +0000
+Subject: [PATCH] Test that every HTTP answer carries the security headers
+
+An API test over the shared test server: the interface's files, API
+answers, a streamed turn, and refusals (404, 405, 422, and the guard's
+403s for a foreign Host and a cross-origin POST) each carry the
+Content-Security-Policy, X-Frame-Options, X-Content-Type-Options and
+Referrer-Policy of docs/specs/frontend.md. The values are spelled out in
+the test, so a header dropped or weakened on the server fails it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WSoiAd58tv7xx9VJhmGiyF
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ backend/tests/api/test_security_headers.py | 85 ++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+ create mode 100644 backend/tests/api/test_security_headers.py
+
+diff --git a/backend/tests/api/test_security_headers.py b/backend/tests/api/test_security_headers.py
+new file mode 100644
+index 0000000..823c953
+--- /dev/null
++++ b/backend/tests/api/test_security_headers.py
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""Every HTTP answer carries the security headers of ``docs/specs/frontend.md``: the files of
++the interface, the API's answers, a streamed turn, and every kind of refusal, the ones the
++guard gives before a route is reached included.
++
++The values are spelled out here rather than imported, so that a header dropped from, or
++weakened in, the list the server keeps fails this test instead of passing with it.
++"""
++
++from __future__ import annotations
++
++import uuid
++
++import httpx
++import pytest
++
++from util.controller_db import requires_postgres
++
++pytestmark = requires_postgres
++
++EXPECTED = {
++    "content-security-policy": (
++        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';"
++        " img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none';"
++        " form-action 'none'; frame-ancestors 'none'"
++    ),
++    "x-frame-options": "DENY",
++    "x-content-type-options": "nosniff",
++    "referrer-policy": "same-origin",
++}
++
++NOWHERE = uuid.UUID(int=0)
++
++ANSWERS = [
++    # (method, path, request headers, request body, the status it is answered with)
++    ("GET", "/ui/", {}, None, 200),
++    ("GET", "/ui/index.html", {}, None, 200),
++    ("GET", "/ui/missing.js", {}, None, 404),
++    ("GET", "/", {}, None, 307),
++    ("GET", "/auth/session", {}, None, 200),
++    ("GET", "/api/agents", {}, None, 200),
++    ("GET", "/api/conversations", {}, None, 200),
++    ("GET", f"/api/conversations/{NOWHERE}", {}, None, 404),
++    ("GET", "/api/conversations/not-a-uuid", {}, None, 422),
++    ("POST", "/api/turns", {}, {"text": 7}, 422),
++    ("DELETE", "/api/conversations", {}, None, 405),
++    ("GET", "/api/no-such-route", {}, None, 404),
++    ("GET", "/api/conversations", {"host": "evil.example"}, None, 403),
++    ("GET", "/ui/", {"host": "evil.example"}, None, 403),
++    ("POST", "/api/turns", {"origin": "http://evil.example"}, {"text": "hi"}, 403),
++]
++
++
++def assert_secured(response: httpx.Response) -> None:
++    carried = {name: response.headers.get(name) for name in EXPECTED}
++    assert carried == EXPECTED, f"{response.request.method} {response.request.url}"
++
++
++@pytest.mark.parametrize(
++    ("method", "path", "headers", "body", "status"),
++    ANSWERS,
++    ids=[f"{m} {p} {s}{' ' + next(iter(h)) if h else ''}" for m, p, h, _, s in ANSWERS],
++)
++def test_an_answer_carries_the_security_headers(
++    api: httpx.Client,
++    method: str,
++    path: str,
++    headers: dict[str, str],
++    body: object,
++    status: int,
++) -> None:
++    response = api.request(method, path, headers=headers, json=body)
++    assert response.status_code == status, response.text
++    assert_secured(response)
++
++
++def test_a_streamed_turn_carries_the_security_headers(api: httpx.Client) -> None:
++    turn = {"agent_id": "pydantic_ai", "text": "hello"}
++    with api.stream("POST", "/api/turns", json=turn) as streamed:
++        assert streamed.status_code == 200
++        assert streamed.headers["content-type"].startswith("text/event-stream")
++        assert_secured(streamed)
++        streamed.read()
+-- 
+2.43.0
+

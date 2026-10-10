@@ -1,0 +1,180 @@
+From 1f2239e9794101f6ddcaaf6f1a83a57d9f9876a5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 14:29:24 +0000
+Subject: [PATCH] Test the security headers on every kind of answer
+
+Every HTTP answer carries the headers of robinauts.web.headers, and nothing
+checked it. The new fast test asks the app, in the local mode and signed in,
+for a route, a stream, a redirect, the interface and its files and 404, and
+every kind of refusal: Host and Origin answered by the Guard before any
+route, a Refused and a controller error from the exception handlers, a
+validation error, no such route and a method not allowed. A last test pins
+the list itself, so a header dropped from it cannot pass the others.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Cm6XJmm2rmCnbrnnCjK4k6
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ .../tests/fast/test_web_security_headers.py   | 150 ++++++++++++++++++
+ 1 file changed, 150 insertions(+)
+ create mode 100644 backend/tests/fast/test_web_security_headers.py
+
+diff --git a/backend/tests/fast/test_web_security_headers.py b/backend/tests/fast/test_web_security_headers.py
+new file mode 100644
+index 0000000..14fe2e9
+--- /dev/null
++++ b/backend/tests/fast/test_web_security_headers.py
+@@ -0,0 +1,150 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""The security headers ride on every HTTP answer, whichever part of the app gives it: a route,
++a stream, a redirect, the files of the interface and their 404, and every kind of refusal --
++the ``Origin`` and ``Host`` checks answered before any route, a ``Refused`` and a controller
++error answered by the exception handlers, a validation error and a path nothing serves. Both
++in the local development mode and signed in, over the memory credentials."""
++
++from __future__ import annotations
++
++import uuid
++from collections.abc import AsyncIterator, Callable
++from contextlib import asynccontextmanager
++from pathlib import Path
++from typing import Any
++
++import httpx
++import pytest
++from echo_controller import CONFIG
++
++from robinauts.controller.composition import compose
++from robinauts.controller.contract.domain import StorageConfig, StorageKind
++from robinauts.web.app import create_app
++from robinauts.web.cookies import Cookies
++from robinauts.web.headers import SECURITY_HEADERS
++from robinauts.web.sign_in import AllowEntry, Matcher, ProviderConfig, SignInConfig
++from util.aio import asyncio_test
++
++LOCAL_URL = "http://127.0.0.1:8000"
++PUBLIC_URL = "https://robinauts.example.com"
++SIGN_IN = SignInConfig(
++    public_url=PUBLIC_URL,
++    providers={
++        "okta": ProviderConfig(
++            id="okta",
++            title="Okta",
++            issuer="https://example.okta.com/oauth2/default",
++            client_id="robinauts",
++            client_secret_env="ROBINAUTS_OKTA_SECRET",
++        )
++    },
++    allow=(AllowEntry("okta", Matcher.EVERYONE, None),),
++)
++SESSION = Cookies(PUBLIC_URL).session
++NOBODY = str(uuid.UUID(int=0))
++TURN = {"agent_id": "echo", "text": "hello"}
++
++Ask = Callable[[httpx.AsyncClient], Any]
++
++LOCAL: dict[str, tuple[int, Ask]] = {
++    "a route": (200, lambda http: http.get("/api/agents")),
++    "a stream": (200, lambda http: http.post("/api/turns", json=TURN)),
++    "a redirect": (307, lambda http: http.get("/")),
++    "the interface": (200, lambda http: http.get("/ui/")),
++    "a file of the interface": (200, lambda http: http.get("/ui/assets/app.js")),
++    "no such file of the interface": (404, lambda http: http.get("/ui/assets/nothing.js")),
++    "a foreign Host": (403, lambda http: http.get("/api/agents", headers={"host": "evil.example"})),
++    "a foreign Host on the interface": (
++        403,
++        lambda http: http.get("/ui/", headers={"host": "evil.example"}),
++    ),
++    "a foreign Origin": (
++        403,
++        lambda http: http.post("/auth/tokens", json={"name": "t"}, headers={"origin": PUBLIC_URL}),
++    ),
++    "a Refused from a route": (404, lambda http: http.delete(f"/auth/tokens/{NOBODY}")),
++    "a controller error": (404, lambda http: http.get(f"/api/conversations/{NOBODY}")),
++    "a validation error": (422, lambda http: http.post("/api/turns", json={})),
++    "no such route": (404, lambda http: http.get("/api/nothing")),
++    "a method not allowed": (405, lambda http: http.put("/api/agents")),
++}
++
++SIGNED_IN: dict[str, tuple[int, Ask]] = {
++    "not signed in": (401, lambda http: http.get("/api/conversations")),
++    "an unknown token": (
++        401,
++        lambda http: http.get("/api/agents", headers={"authorization": "Bearer nonsense"}),
++    ),
++    "a write from another site with a session": (
++        403,
++        lambda http: http.post(
++            "/auth/logout",
++            headers={"cookie": f"{SESSION}=x", "origin": "https://evil.example"},
++        ),
++    ),
++    "the interface, signed out": (200, lambda http: http.get("/ui/")),
++}
++
++
++@pytest.fixture
++def ui_dir(tmp_path: Path) -> Path:
++    """A built interface of two files."""
++    (tmp_path / "assets").mkdir()
++    (tmp_path / "index.html").write_text("<!doctype html><title>Robinauts</title>")
++    (tmp_path / "assets" / "app.js").write_text("console.log('robinauts')")
++    return tmp_path
++
++
++@asynccontextmanager
++async def client(
++    ui_dir: Path, sign_in: SignInConfig | None, base_url: str
++) -> AsyncIterator[httpx.AsyncClient]:
++    composed = compose(CONFIG, storage=StorageConfig(StorageKind.IN_MEMORY), secret_for={}.get)
++    app = create_app(composed, sign_in=sign_in, secret_for={}.get, ui_dir=ui_dir)
++    async with app.router.lifespan_context(app):
++        transport = httpx.ASGITransport(app=app)
++        async with httpx.AsyncClient(transport=transport, base_url=base_url) as http:
++            yield http
++
++
++def assert_secured(answer: httpx.Response) -> None:
++    for name, value in SECURITY_HEADERS:
++        assert answer.headers.get_list(name) == [value], name
++
++
++@pytest.mark.parametrize("what", LOCAL)
++@asyncio_test
++async def test_every_answer_in_the_local_mode_carries_the_security_headers(
++    ui_dir: Path, what: str
++) -> None:
++    status, ask = LOCAL[what]
++    async with client(ui_dir, None, LOCAL_URL) as http:
++        answer = await ask(http)
++    assert answer.status_code == status, answer.text
++    assert_secured(answer)
++
++
++@pytest.mark.parametrize("what", SIGNED_IN)
++@asyncio_test
++async def test_every_answer_signed_in_carries_the_security_headers(ui_dir: Path, what: str) -> None:
++    status, ask = SIGNED_IN[what]
++    async with client(ui_dir, SIGN_IN, PUBLIC_URL) as http:
++        answer = await ask(http)
++    assert answer.status_code == status, answer.text
++    assert_secured(answer)
++
++
++def test_the_headers_are_the_interfaces_policy() -> None:
++    """The list itself: a header dropped from it would pass every test above."""
++    assert dict(SECURITY_HEADERS) == {
++        "content-security-policy": (
++            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';"
++            " img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none';"
++            " form-action 'none'; frame-ancestors 'none'"
++        ),
++        "x-frame-options": "DENY",
++        "x-content-type-options": "nosniff",
++        "referrer-policy": "same-origin",
++    }
+-- 
+2.43.0
+

@@ -1,0 +1,138 @@
+From 0af39892712088fb3fc4a6e3282a3ad4e2e4690e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 17:23:51 +0000
+Subject: [PATCH] Test that every HTTP answer carries the security headers
+
+The API's answers, its refusals (including those Guard gives before any
+route), the redirects, a streamed turn, and the interface's files, built
+or not, in both the signed-in and the local development mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EdaMv891NCzHKUE2B1MtSL
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ .../tests/fast/test_web_security_headers.py   | 112 ++++++++++++++++++
+ 1 file changed, 112 insertions(+)
+ create mode 100644 backend/tests/fast/test_web_security_headers.py
+
+diff --git a/backend/tests/fast/test_web_security_headers.py b/backend/tests/fast/test_web_security_headers.py
+new file mode 100644
+index 0000000..bb2ebb1
+--- /dev/null
++++ b/backend/tests/fast/test_web_security_headers.py
+@@ -0,0 +1,112 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""Every HTTP answer carries ``SECURITY_HEADERS``: the API's, its refusals, those ``Guard``
++answers before any route is reached, the redirects, a streamed turn, and the files of the
++interface, built or not. Over the web app on the echo engine and the in-memory store."""
++
++from __future__ import annotations
++
++from collections.abc import AsyncIterator
++from contextlib import asynccontextmanager
++from pathlib import Path
++
++import httpx
++from echo_controller import CONFIG
++
++from robinauts.controller.composition import compose
++from robinauts.controller.contract.domain import StorageConfig, StorageKind
++from robinauts.web.app import create_app
++from robinauts.web.cookies import Cookies
++from robinauts.web.headers import SECURITY_HEADERS
++from robinauts.web.sign_in import AllowEntry, Matcher, ProviderConfig, SignInConfig
++from util.aio import asyncio_test
++
++PUBLIC_URL = "https://robinauts.example.com"
++SIGN_IN = SignInConfig(
++    public_url=PUBLIC_URL,
++    providers={
++        "okta": ProviderConfig(
++            id="okta",
++            title="Okta",
++            issuer="https://example.okta.com/oauth2/default",
++            client_id="robinauts",
++            client_secret_env="ROBINAUTS_OKTA_SECRET",
++        )
++    },
++    allow=(AllowEntry("okta", Matcher.EVERYONE, None),),
++)
++
++
++@asynccontextmanager
++async def client(
++    sign_in: SignInConfig | None, ui_dir: Path | None = None
++) -> AsyncIterator[httpx.AsyncClient]:
++    composed = compose(CONFIG, storage=StorageConfig(StorageKind.IN_MEMORY), secret_for={}.get)
++    app = create_app(composed, sign_in=sign_in, secret_for={}.get, ui_dir=ui_dir)
++    base_url = PUBLIC_URL if sign_in is not None else "http://127.0.0.1"
++    async with app.router.lifespan_context(app):
++        transport = httpx.ASGITransport(app=app)
++        async with httpx.AsyncClient(transport=transport, base_url=base_url) as http:
++            yield http
++
++
++def assert_secured(answer: httpx.Response, status: int) -> None:
++    assert answer.status_code == status, answer.text
++    assert {name: answer.headers.get(name) for name, _ in SECURITY_HEADERS} == dict(
++        SECURITY_HEADERS
++    ), f"{answer.request.method} {answer.request.url}"
++
++
++@asyncio_test
++async def test_the_answers_and_refusals_of_the_signed_in_mode_carry_them() -> None:
++    session = Cookies(PUBLIC_URL).session
++    async with client(SIGN_IN) as http:
++        assert_secured(await http.get("/auth/session"), 200)
++        assert_secured(await http.get("/health"), 200)
++        # Refused by a route: nobody is signed in.
++        assert_secured(await http.get("/api/agents"), 401)
++        # Refused by Guard, before any route: a cookie write from another origin.
++        cross_site = {"cookie": f"{session}=whatever", "origin": "https://evil.example"}
++        refused = await http.post("/auth/logout", headers=cross_site)
++        assert_secured(refused, 403)
++        assert refused.json()["error"] == "Forbidden"
++        assert_secured(await http.get("/api/no-such-route"), 404)
++        assert_secured(await http.get("/"), 307)
++        # A sign-in refused is a redirect to the sign-in page, which names the error.
++        unknown = await http.get("/auth/login/no-such-provider")
++        assert_secured(unknown, 302)
++        assert "/ui/#/sign-in?error=" in unknown.headers["location"]
++
++
++@asyncio_test
++async def test_the_api_a_streamed_turn_and_the_guards_refusals_of_the_local_mode_carry_them() -> (
++    None
++):
++    async with client(None) as http:
++        assert_secured(await http.get("/api/agents"), 200)
++        assert_secured(await http.post("/api/turns", json={"agent_id": "echo", "text": "hi"}), 200)
++        assert_secured(await http.post("/api/turns", json={"agent_id": "nobody"}), 422)
++        # Refused by Guard: a Host that is not local, and a write from another origin.
++        assert_secured(await http.get("/api/agents", headers={"host": "evil.example"}), 403)
++        assert_secured(await http.get("/ui/", headers={"host": "evil.example"}), 403)
++        foreign = {"origin": "https://evil.example"}
++        assert_secured(await http.post("/api/turns", json={}, headers=foreign), 403)
++        # The page that stands in for an interface that is not built.
++        assert_secured(await http.get("/ui/"), 200)
++
++
++@asyncio_test
++async def test_the_files_of_the_interface_carry_them(tmp_path: Path) -> None:
++    (tmp_path / "index.html").write_text("<!doctype html><title>Robinauts</title>")
++    (tmp_path / "assets").mkdir()
++    (tmp_path / "assets" / "app.js").write_text("console.log('robinauts')")
++    async with client(None, ui_dir=tmp_path) as http:
++        page = await http.get("/ui/")
++        assert_secured(page, 200)
++        assert "<title>Robinauts</title>" in page.text
++        script = await http.get("/ui/assets/app.js")
++        assert_secured(script, 200)
++        assert script.headers["content-type"].startswith("text/javascript")
++        assert_secured(await http.get("/ui/assets/missing.js"), 404)
++        assert_secured(await http.get("/ui/index.html", headers={"host": "evil.example"}), 403)
+-- 
+2.43.0
+

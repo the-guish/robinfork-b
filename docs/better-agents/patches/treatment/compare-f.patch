@@ -1,0 +1,108 @@
+From 8faa46894c14617b1b49b155a327230e55466197 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 18:07:33 +0000
+Subject: [PATCH] Test that every HTTP answer carries the security headers
+
+An API test over the shared test server: the interface's page and a
+file it lacks, the redirect to it, /health, an API answer, a streamed
+turn, and the refusals of the route (404, 422), the router (404, 405)
+and the guard (foreign Host, foreign Origin) each carry the
+Content-Security-Policy, X-Frame-Options, X-Content-Type-Options and
+Referrer-Policy the backend promises.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WSoiAd58tv7xx9VJhmGiyF
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ backend/tests/api/test_security_headers.py | 79 ++++++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+ create mode 100644 backend/tests/api/test_security_headers.py
+
+diff --git a/backend/tests/api/test_security_headers.py b/backend/tests/api/test_security_headers.py
+new file mode 100644
+index 0000000..f06b16b
+--- /dev/null
++++ b/backend/tests/api/test_security_headers.py
+@@ -0,0 +1,79 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""Every HTTP answer carries the security headers: the interface's files, the API's answers,
++a streamed turn, and the refusals of the guard, of a route and of the router. No browser shows
++them on an answer it does not render, so they are asserted here."""
++
++from __future__ import annotations
++
++import uuid
++
++import httpx
++import pytest
++
++from util.controller_db import requires_postgres
++
++pytestmark = requires_postgres
++
++SECURITY_HEADERS = {
++    "content-security-policy": (
++        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';"
++        " img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none';"
++        " form-action 'none'; frame-ancestors 'none'"
++    ),
++    "x-frame-options": "DENY",
++    "x-content-type-options": "nosniff",
++    "referrer-policy": "same-origin",
++}
++
++NOWHERE = str(uuid.uuid4())
++
++ANSWERS = [
++    pytest.param("GET", "/ui/", {}, None, 200, id="the interface's page"),
++    pytest.param("GET", "/ui/missing.js", {}, None, 404, id="a file the interface lacks"),
++    pytest.param("GET", "/", {}, None, 307, id="the redirect to the interface"),
++    pytest.param("GET", "/health", {}, None, 200, id="health"),
++    pytest.param("GET", "/api/agents", {}, None, 200, id="an API answer"),
++    pytest.param("GET", f"/api/conversations/{NOWHERE}", {}, None, 404, id="an unknown id"),
++    pytest.param("POST", "/api/turns", {}, {"text": 1}, 422, id="a malformed body"),
++    pytest.param("GET", "/no/such/path", {}, None, 404, id="an unknown path"),
++    pytest.param("DELETE", "/health", {}, None, 405, id="a method not allowed"),
++    pytest.param("GET", "/api/agents", {"host": "rebound.example"}, None, 403, id="a foreign host"),
++    pytest.param(
++        "POST",
++        "/api/turns",
++        {"origin": "https://elsewhere.example"},
++        {"agent_id": "pydantic_ai", "text": "hello"},
++        403,
++        id="a foreign origin",
++    ),
++]
++
++
++def assert_secured(response: httpx.Response) -> None:
++    carried = {name: response.headers.get(name) for name in SECURITY_HEADERS}
++    assert carried == SECURITY_HEADERS, (response.request.method, response.request.url)
++
++
++@pytest.mark.parametrize(("method", "path", "headers", "body", "status"), ANSWERS)
++def test_every_answer_carries_the_security_headers(
++    api: httpx.Client,
++    method: str,
++    path: str,
++    headers: dict[str, str],
++    body: object,
++    status: int,
++) -> None:
++    response = api.request(method, path, headers=headers, json=body, follow_redirects=False)
++    assert response.status_code == status, response.text
++    assert_secured(response)
++
++
++def test_a_streamed_turn_carries_the_security_headers(api: httpx.Client) -> None:
++    turn = {"agent_id": "pydantic_ai", "text": "hello"}
++    with api.stream("POST", "/api/turns", json=turn) as streamed:
++        assert streamed.status_code == 200
++        assert streamed.headers["content-type"].startswith("text/event-stream")
++        assert_secured(streamed)
++        streamed.read()
+-- 
+2.43.0
+

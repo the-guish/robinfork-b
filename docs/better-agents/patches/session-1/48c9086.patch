@@ -1,0 +1,90 @@
+From 48c9086c1f87b0e183be2dfac269b913ab812dd8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 14:32:52 +0000
+Subject: [PATCH] Test the security headers on the real server's answers
+
+The in-process test of tests/fast asks the app directly. This one asks the
+robinauts server a deployment runs, over uvicorn, and checks that every
+kind of answer carries each security header exactly once: the interface,
+its missing files and refused writes, the API, a streamed turn, and the
+refusals of the guard, the controller, validation and routing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Cm6XJmm2rmCnbrnnCjK4k6
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ backend/tests/api/test_security_headers.py | 62 ++++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+ create mode 100644 backend/tests/api/test_security_headers.py
+
+diff --git a/backend/tests/api/test_security_headers.py b/backend/tests/api/test_security_headers.py
+new file mode 100644
+index 0000000..c9bbbfb
+--- /dev/null
++++ b/backend/tests/api/test_security_headers.py
+@@ -0,0 +1,62 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""The security headers on what the real ``robinauts`` server answers: the interface, the API,
++a streamed turn, and every kind of refusal, each header once and with its value.
++
++``tests/fast/test_web_headers.py`` asks the app in process; this asks the server a deployment
++runs, so what uvicorn puts between the two is under test too.
++"""
++
++from __future__ import annotations
++
++import uuid
++
++import httpx
++
++from robinauts.web.headers import SECURITY_HEADERS
++from util.controller_db import requires_postgres
++
++pytestmark = requires_postgres
++
++
++def test_every_answer_of_the_server_carries_the_security_headers(api: httpx.Client) -> None:
++    foreign = {"origin": "https://evil.example"}
++    nobody = uuid.uuid4()
++    answers = {
++        "the page": api.get("/ui/"),
++        "a missing file of the interface": api.get("/ui/assets/nothing.js"),
++        "a write to the interface": api.post("/ui/"),
++        "a write to the interface from another site": api.post("/ui/", headers=foreign),
++        "the way to the interface": api.get("/"),
++        "the API": api.get("/api/conversations"),
++        "a streamed turn": api.post("/api/turns", json={"agent_id": "langchain", "text": "hi"}),
++        "a conversation nobody has": api.get(f"/api/conversations/{nobody}"),
++        "a malformed request": api.post("/api/turns", json={}),
++        "a call from another site": api.delete(f"/api/conversations/{nobody}", headers=foreign),
++        "a call through another host": api.get(
++            "/api/conversations", headers={"host": "evil.example"}
++        ),
++        "a path that is nothing": api.get("/nothing"),
++        "health": api.get("/health"),
++    }
++    statuses = {name: answer.status_code for name, answer in answers.items()}
++    assert statuses == {
++        "the page": 200,
++        "a missing file of the interface": 404,
++        "a write to the interface": 405,
++        "a write to the interface from another site": 403,
++        "the way to the interface": 307,
++        "the API": 200,
++        "a streamed turn": 200,
++        "a conversation nobody has": 404,
++        "a malformed request": 422,
++        "a call from another site": 403,
++        "a call through another host": 403,
++        "a path that is nothing": 404,
++        "health": 200,
++    }
++    assert answers["a streamed turn"].headers["content-type"].startswith("text/event-stream")
++    for name, answer in answers.items():
++        for header, value in SECURITY_HEADERS:
++            assert answer.headers.get_list(header) == [value], (name, header)
+-- 
+2.43.0
+

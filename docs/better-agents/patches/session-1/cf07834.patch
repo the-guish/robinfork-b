@@ -1,0 +1,95 @@
+From cf078343214646e7c6fa47013467131d6595a64d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 14:35:08 +0000
+Subject: [PATCH] Test the security headers on the real server's answers
+
+tests/api/test_security_headers.py asks the `robinauts start` server, through
+uvicorn, for the interface, its files, the redirect to it, the API, /health and
+an unknown path, and for the refusals of each: 404, 405, 422, and the 403s
+Guard gives a foreign Host or Origin before a route or the interface is
+reached. Every answer must carry each of SECURITY_HEADERS exactly once.
+
+The in-process test in tests/fast covers a Guard refusal of the API only.
+Were Guard ever added outside SecurityHeaders, this test fails on the
+refusals of the interface and of the API alike.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Cm6XJmm2rmCnbrnnCjK4k6
+---
+ backend/tests/api/test_security_headers.py | 64 ++++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+ create mode 100644 backend/tests/api/test_security_headers.py
+
+diff --git a/backend/tests/api/test_security_headers.py b/backend/tests/api/test_security_headers.py
+new file mode 100644
+index 0000000..9d5fcd5
+--- /dev/null
++++ b/backend/tests/api/test_security_headers.py
+@@ -0,0 +1,64 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""Every answer of the real ``robinauts`` server carries the security headers: the API, the
++files of the interface, the redirects to it, and the refusals of all of them, among them the
++ones ``Guard`` gives before a route or the interface is reached.
++
++``tests/fast/test_web_headers.py`` asks the application in-process; this asks the server a
++deployment runs, through uvicorn, so a header the server drops or doubles shows here.
++"""
++
++from __future__ import annotations
++
++import uuid
++
++import httpx
++import pytest
++
++from robinauts.web.headers import SECURITY_HEADERS
++from util.controller_db import requires_postgres
++
++pytestmark = requires_postgres
++
++FOREIGN_HOST = {"host": "evil.example"}
++FOREIGN_ORIGIN = {"origin": "https://evil.example"}
++JSON = {"content-type": "application/json"}
++NOBODY = f"/api/conversations/{uuid.UUID(int=0)}"
++
++# (what is asked, method, path, headers, body, the status it is answered with)
++ANSWERS = [
++    ("interface", "GET", "/ui/", {}, None, 200),
++    ("interface file", "GET", "/ui/index.html", {}, None, 200),
++    ("interface missing file", "GET", "/ui/assets/nothing.js", {}, None, 404),
++    ("interface write", "POST", "/ui/", {}, None, 405),
++    ("interface foreign host", "GET", "/ui/", FOREIGN_HOST, None, 403),
++    ("interface foreign origin", "POST", "/ui/", FOREIGN_ORIGIN, None, 403),
++    ("redirect to the interface", "GET", "/", {}, None, 307),
++    ("api", "GET", "/api/conversations", {}, None, 200),
++    ("api unknown conversation", "GET", NOBODY, {}, None, 404),
++    ("api invalid body", "POST", "/api/turns", JSON, b"not json", 422),
++    ("api foreign host", "GET", "/api/conversations", FOREIGN_HOST, None, 403),
++    ("api foreign origin", "POST", "/api/turns", {**JSON, **FOREIGN_ORIGIN}, b"{}", 403),
++    ("unknown path", "GET", "/nothing-here", {}, None, 404),
++    ("health", "GET", "/health", {}, None, 200),
++]
++
++
++@pytest.mark.parametrize(
++    ("method", "path", "headers", "body", "status"),
++    [answer[1:] for answer in ANSWERS],
++    ids=[answer[0] for answer in ANSWERS],
++)
++def test_every_answer_carries_the_security_headers(
++    api: httpx.Client,
++    method: str,
++    path: str,
++    headers: dict[str, str],
++    body: bytes | None,
++    status: int,
++) -> None:
++    answer = api.request(method, path, headers=headers, content=body)
++    assert answer.status_code == status, answer.text
++    for header, value in SECURITY_HEADERS:
++        assert answer.headers.get_list(header) == [value], header
+-- 
+2.43.0
+

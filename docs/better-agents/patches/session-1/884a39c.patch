@@ -1,0 +1,138 @@
+From 884a39c551eadf7da23dbd7c3971c764cfc657fb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 14:30:26 +0000
+Subject: [PATCH] Test the security headers on the real server's answers
+
+Starts the real `robinauts` server in memory, so PostgreSQL is not needed, and
+sends its requests through uvicorn. It checks that each answer carries every
+header of SECURITY_HEADERS exactly once. The answers are the interface's page
+and files, a missing file, a write to the interface, the redirect, the API,
+a streamed turn, and the refusals from the router, the routes, validation and
+the same-origin guard. `stack.server` now takes `None` for the database to
+start the server in memory.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Cm6XJmm2rmCnbrnnCjK4k6
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ backend/tests/api/test_security_headers.py | 80 ++++++++++++++++++++++
+ backend/tests/util/stack.py                | 11 +--
+ 2 files changed, 87 insertions(+), 4 deletions(-)
+ create mode 100644 backend/tests/api/test_security_headers.py
+
+diff --git a/backend/tests/api/test_security_headers.py b/backend/tests/api/test_security_headers.py
+new file mode 100644
+index 0000000..824a39f
+--- /dev/null
++++ b/backend/tests/api/test_security_headers.py
+@@ -0,0 +1,80 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""The security headers on every answer of the real ``robinauts`` server, over the wire.
++
++The interface's files, the API, a streamed turn, and the refusals, whoever gives them: a route,
++the guard in front of every request, the router, the static files. Each header comes once, with
++the value of ``SECURITY_HEADERS``. ``tests/fast/test_web_headers.py`` asks the app in process;
++this asks it through uvicorn, as a browser does. The server keeps its conversations in memory,
++so no PostgreSQL is needed.
++"""
++
++from __future__ import annotations
++
++import uuid
++from collections.abc import Iterator
++
++import httpx
++import pytest
++
++from robinauts.web.headers import SECURITY_HEADERS
++from util import stack
++from util.fake_openai import FakeLocalGPTServer
++
++pytestmark = pytest.mark.io
++
++
++@pytest.fixture(scope="module")
++def in_memory_server(
++    model_server: FakeLocalGPTServer, tmp_path_factory: pytest.TempPathFactory
++) -> Iterator[str]:
++    here = tmp_path_factory.mktemp("headers")
++    config = here / "robinauts.toml"
++    config.write_text(stack.config_for(model_server.base_url))
++    ui = here / "ui"
++    (ui / "assets").mkdir(parents=True)
++    (ui / "index.html").write_text("<!doctype html><title>Robinauts</title>")
++    (ui / "assets" / "app.js").write_text("export {};\n")
++    env = {**stack.API_KEY, "ROBINAUTS_UI_DIR": str(ui)}
++    with stack.server(config, None, env=env) as running:
++        yield running
++
++
++def answers(http: httpx.Client) -> dict[str, tuple[int, httpx.Response]]:
++    """Each answer by name, with the status it must have."""
++    elsewhere = {"host": "evil.example"}
++    nowhere = f"/api/conversations/{uuid.uuid4()}"
++    turn = {"agent_id": "pydantic_ai", "text": "hello"}
++    return {
++        "the page": (200, http.get("/ui/")),
++        "a file of the interface": (200, http.get("/ui/assets/app.js")),
++        "a missing file": (404, http.get("/ui/assets/nothing.js")),
++        "a write to the interface": (405, http.post("/ui/")),
++        "the redirect to the interface": (307, http.get("/")),
++        "the session": (200, http.get("/auth/session")),
++        "an API answer": (200, http.get("/api/conversations")),
++        "a streamed turn": (200, http.post("/api/turns", json=turn)),
++        "an unknown route": (404, http.get("/api/nothing")),
++        "an unknown conversation": (404, http.get(nowhere)),
++        "an invalid body": (422, http.post("/api/turns", json={})),
++        "a foreign host on the API": (403, http.get("/api/conversations", headers=elsewhere)),
++        "a foreign host on the interface": (403, http.get("/ui/", headers=elsewhere)),
++        "a write from another origin": (
++            403,
++            http.post("/api/turns", json=turn, headers={"origin": "https://evil.example"}),
++        ),
++    }
++
++
++def test_every_answer_carries_the_security_headers(
++    in_memory_server: str, local_gpt: FakeLocalGPTServer
++) -> None:
++    with httpx.Client(base_url=in_memory_server, timeout=30.0) as http:
++        given = answers(http)
++    statuses = {name: answer.status_code for name, (_, answer) in given.items()}
++    assert statuses == {name: status for name, (status, _) in given.items()}
++    for name, (_, answer) in given.items():
++        for header, value in SECURITY_HEADERS:
++            assert answer.headers.get_list(header) == [value], (name, header)
++    assert '"RUN_FINISHED"' in given["a streamed turn"][1].text
+diff --git a/backend/tests/util/stack.py b/backend/tests/util/stack.py
+index 342063e..8419706 100644
+--- a/backend/tests/util/stack.py
++++ b/backend/tests/util/stack.py
+@@ -157,15 +157,18 @@ def database(config: Path) -> Iterator[str]:
+ @contextmanager
+ def server(
+     config: Path,
+-    database_url: str,
++    database_url: str | None,
+     env: Mapping[str, str] = {},
+     started: list[subprocess.Popen[bytes]] | None = None,
+ ) -> Iterator[str]:
+-    """The URL of a server on that config, without sign-in, stopped afterwards. Its process is
+-    added to ``started``, for a test that kills it."""
++    """The URL of a server on that config, without sign-in, stopped afterwards: on the database
++    ``database_url`` names, or in memory when it is ``None``. Its process is added to
++    ``started``, for a test that kills it."""
+     port = free_port()
+     environment = {**os.environ, **env, "ROBINAUTS_CONFIG": str(config)}
+-    environment["ROBINAUTS_DATABASE_URL"] = database_url
++    environment.pop("ROBINAUTS_DATABASE_URL", None)
++    if database_url is not None:
++        environment["ROBINAUTS_DATABASE_URL"] = database_url
+     command = [str(ROBINAUTS), "start", "--dev-no-sign-in", "--port", str(port)]
+     with subprocess.Popen(command, env=environment) as running:
+         if started is not None:
+-- 
+2.43.0
+

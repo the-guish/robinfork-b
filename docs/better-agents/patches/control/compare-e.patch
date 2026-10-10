@@ -1,0 +1,149 @@
+From 3f425f56eb7d637b6b290f7af8d52082425b2ac5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 17:23:23 +0000
+Subject: [PATCH] Test the security headers on every HTTP answer
+
+API answers, a stream, the Origin guard's and the handlers' refusals,
+FastAPI's 404 and 422, the 401s of the sign-in mode, and the files of
+the interface, built or not, all carry the four headers of
+docs/specs/frontend.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EdaMv891NCzHKUE2B1MtSL
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ .../tests/fast/test_web_security_headers.py   | 122 ++++++++++++++++++
+ 1 file changed, 122 insertions(+)
+ create mode 100644 backend/tests/fast/test_web_security_headers.py
+
+diff --git a/backend/tests/fast/test_web_security_headers.py b/backend/tests/fast/test_web_security_headers.py
+new file mode 100644
+index 0000000..77d3d62
+--- /dev/null
++++ b/backend/tests/fast/test_web_security_headers.py
+@@ -0,0 +1,122 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""Every HTTP answer carries the security headers of ``docs/specs/frontend.md``: the API's,
++its streams, its refusals (the ``Origin`` guard's, the exception handlers', FastAPI's own
++404 and 422) and the files of the interface. Over the web app on the echo engine and the
++in-memory store; the sign-in mode names a provider it never reaches."""
++
++from __future__ import annotations
++
++from collections.abc import AsyncIterator
++from contextlib import asynccontextmanager
++from pathlib import Path
++
++import httpx
++from echo_controller import CONFIG
++
++from robinauts.controller.composition import compose
++from robinauts.controller.contract.domain import StorageConfig, StorageKind
++from robinauts.web.app import create_app
++from robinauts.web.sign_in import AllowEntry, Matcher, ProviderConfig, SignInConfig
++from util.aio import asyncio_test
++
++EXPECTED = {
++    "content-security-policy": (
++        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';"
++        " img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none';"
++        " form-action 'none'; frame-ancestors 'none'"
++    ),
++    "x-frame-options": "DENY",
++    "x-content-type-options": "nosniff",
++    "referrer-policy": "same-origin",
++}
++PUBLIC_URL = "http://127.0.0.1:8000"
++
++
++@asynccontextmanager
++async def client(
++    ui_dir: Path | None, sign_in: SignInConfig | None = None, base_url: str = "http://127.0.0.1"
++) -> AsyncIterator[httpx.AsyncClient]:
++    composed = compose(CONFIG, storage=StorageConfig(StorageKind.IN_MEMORY), secret_for={}.get)
++    app = create_app(composed, sign_in=sign_in, secret_for={}.get, ui_dir=ui_dir)
++    async with app.router.lifespan_context(app):
++        transport = httpx.ASGITransport(app=app)
++        async with httpx.AsyncClient(transport=transport, base_url=base_url) as http:
++            yield http
++
++
++def assert_secured(answer: httpx.Response, status: int) -> None:
++    assert answer.status_code == status, (answer.request.url, answer.text)
++    carried = {name: answer.headers.get(name) for name in EXPECTED}
++    assert carried == EXPECTED, (answer.request.method, answer.request.url)
++
++
++def built_interface(tmp_path: Path) -> Path:
++    ui = tmp_path / "ui"
++    (ui / "assets").mkdir(parents=True)
++    (ui / "index.html").write_text("<!doctype html><title>Robinauts</title>")
++    (ui / "assets" / "app.js").write_text("console.log('robinauts')")
++    return ui
++
++
++@asyncio_test
++async def test_answers_streams_and_refusals_in_the_local_mode_carry_them(tmp_path: Path) -> None:
++    async with client(built_interface(tmp_path)) as http:
++        assert_secured(await http.get("/api/agents"), 200)
++        assert_secured(await http.get("/auth/session"), 200)
++        assert_secured(await http.get("/health"), 200)
++        assert_secured(await http.get("/"), 307)
++
++        streamed = await http.post("/api/turns", json={"agent_id": "echo", "text": "hello"})
++        assert_secured(streamed, 200)
++        assert streamed.headers["content-type"].startswith("text/event-stream")
++
++        # The interface's files, and the one it does not have.
++        assert_secured(await http.get("/ui/"), 200)
++        assert_secured(await http.get("/ui/index.html"), 200)
++        assert_secured(await http.get("/ui/assets/app.js"), 200)
++        assert_secured(await http.get("/ui/assets/missing.js"), 404)
++
++        # The guard's refusals: a host that is not this machine, a write from elsewhere.
++        assert_secured(await http.get("/api/agents", headers={"host": "evil.example"}), 403)
++        assert_secured(await http.get("/ui/", headers={"host": "evil.example"}), 403)
++        elsewhere = {"origin": "http://evil.example"}
++        assert_secured(await http.post("/api/turns", json={}, headers=elsewhere), 403)
++
++        # FastAPI's own refusals and the routes'.
++        assert_secured(await http.get("/nowhere"), 404)
++        assert_secured(await http.post("/api/turns", json={"text": 1}), 422)
++        missing = "/api/conversations/00000000-0000-0000-0000-000000000000"
++        assert_secured(await http.get(missing), 404)
++
++
++@asyncio_test
++async def test_the_page_of_an_interface_not_built_carries_them() -> None:
++    async with client(None) as http:
++        assert_secured(await http.get("/ui/"), 200)
++
++
++@asyncio_test
++async def test_the_refusals_of_the_sign_in_mode_carry_them(tmp_path: Path) -> None:
++    okta = ProviderConfig(
++        id="okta",
++        title="Okta",
++        issuer="https://example.okta.com/oauth2/default",
++        client_id="robinauts",
++        client_secret_env="ROBINAUTS_OKTA_SECRET",
++        scopes=("openid", "email", "profile"),
++        groups_claim="groups",
++    )
++    sign_in = SignInConfig(
++        public_url=PUBLIC_URL,
++        providers={"okta": okta},
++        allow=(AllowEntry("okta", Matcher.EVERYONE, None),),
++    )
++    async with client(built_interface(tmp_path), sign_in, base_url=PUBLIC_URL) as http:
++        assert_secured(await http.get("/api/conversations"), 401)
++        bearer = {"authorization": "Bearer not-a-token"}
++        assert_secured(await http.get("/api/conversations", headers=bearer), 401)
++        cookie = {"cookie": "robinauts_session=stolen", "origin": "http://evil.example"}
++        assert_secured(await http.post("/api/turns", json={}, headers=cookie), 403)
++        assert_secured(await http.get("/ui/"), 200)
+-- 
+2.43.0
+

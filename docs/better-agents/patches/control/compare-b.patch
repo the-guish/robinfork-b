@@ -1,0 +1,135 @@
+From 1ca94a412a24e9a07d167af62408b738d2655b9e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 17:07:27 +0000
+Subject: [PATCH] Test that every HTTP answer carries the security headers
+
+API answers, the event stream, redirects, the interface's files and its
+fallback page, and the refusals of the Host/Origin guard, the exception
+handlers, validation, routing and sign-in, all checked against
+SECURITY_HEADERS. Fails if SecurityHeaders is moved inside the guard.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EdaMv891NCzHKUE2B1MtSL
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ backend/tests/fast/test_web_headers.py | 108 +++++++++++++++++++++++++
+ 1 file changed, 108 insertions(+)
+ create mode 100644 backend/tests/fast/test_web_headers.py
+
+diff --git a/backend/tests/fast/test_web_headers.py b/backend/tests/fast/test_web_headers.py
+new file mode 100644
+index 0000000..3952391
+--- /dev/null
++++ b/backend/tests/fast/test_web_headers.py
+@@ -0,0 +1,108 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright The Robinauts Authors
++
++"""Every HTTP answer carries ``SECURITY_HEADERS``: an API answer, a stream, a redirect, the
++interface's files and its fallback page, and the refusals of each layer, the ``Origin`` and
++``Host`` guard, the exception handlers, validation and the routing. Over the echo engine and
++the in-memory store, signed in through nobody, and with sign-in configured for a provider
++that is never asked."""
++
++from __future__ import annotations
++
++import uuid
++from collections.abc import AsyncIterator
++from contextlib import asynccontextmanager
++from pathlib import Path
++
++import httpx
++from echo_controller import CONFIG
++
++from robinauts.controller.composition import compose
++from robinauts.controller.contract.domain import StorageConfig, StorageKind
++from robinauts.web.app import create_app
++from robinauts.web.headers import SECURITY_HEADERS
++from robinauts.web.sign_in import AllowEntry, Matcher, ProviderConfig, SignInConfig
++from util.aio import asyncio_test
++
++PUBLIC_URL = "http://127.0.0.1:8000"
++
++
++@asynccontextmanager
++async def client(
++    *, ui_dir: Path | None = None, sign_in: SignInConfig | None = None
++) -> AsyncIterator[httpx.AsyncClient]:
++    composed = compose(CONFIG, storage=StorageConfig(StorageKind.IN_MEMORY), secret_for={}.get)
++    app = create_app(composed, sign_in=sign_in, secret_for={}.get, ui_dir=ui_dir)
++    async with app.router.lifespan_context(app):
++        transport = httpx.ASGITransport(app=app)
++        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as http:
++            yield http
++
++
++def assert_secured(answer: httpx.Response, status: int) -> None:
++    where = f"{answer.request.method} {answer.request.url.path}"
++    assert answer.status_code == status, where
++    for name, value in SECURITY_HEADERS:
++        assert answer.headers.get_list(name) == [value], f"{where}: {name}"
++
++
++@asyncio_test
++async def test_every_answer_of_the_local_mode_carries_the_security_headers(
++    tmp_path: Path,
++) -> None:
++    (tmp_path / "index.html").write_text("<!doctype html><title>Robinauts</title>")
++    (tmp_path / "app.js").write_text("export {};")
++    async with client(ui_dir=tmp_path) as http:
++        assert_secured(await http.get("/api/agents"), 200)
++        assert_secured(await http.get("/auth/session"), 200)
++        assert_secured(await http.get("/health"), 200)
++        assert_secured(await http.get("/"), 307)
++        assert_secured(await http.get("/ui/"), 200)
++        assert_secured(await http.get("/ui/app.js"), 200)
++        assert_secured(await http.get("/ui/missing.js"), 404)
++
++        streamed = await http.post("/api/turns", json={"agent_id": "echo", "text": "hello"})
++        assert_secured(streamed, 200)
++        assert streamed.headers["content-type"].startswith("text/event-stream")
++
++        # The refusals: the controller's, validation's, routing's and the guard's, which
++        # reaches the interface's files as well as the routes.
++        assert_secured(await http.get(f"/api/conversations/{uuid.uuid4()}"), 404)
++        assert_secured(await http.post("/api/turns", json={}), 422)
++        assert_secured(await http.get("/nowhere"), 404)
++        assert_secured(await http.delete("/health"), 405)
++        rebound = {"host": "robinauts.example.com"}
++        assert_secured(await http.get("/api/agents", headers=rebound), 403)
++        assert_secured(await http.get("/ui/", headers=rebound), 403)
++        foreign = {"origin": "https://elsewhere.example.com"}
++        assert_secured(await http.post("/api/turns", json={}, headers=foreign), 403)
++
++
++@asyncio_test
++async def test_the_fallback_page_carries_the_security_headers() -> None:
++    async with client() as http:
++        assert_secured(await http.get("/ui/"), 200)
++
++
++@asyncio_test
++async def test_the_refusals_of_sign_in_carry_the_security_headers() -> None:
++    okta = ProviderConfig(
++        id="okta",
++        title="Okta",
++        issuer="https://okta.example.com",
++        client_id="robinauts",
++        client_secret_env="ROBINAUTS_OKTA_SECRET",
++    )
++    sign_in = SignInConfig(
++        public_url=PUBLIC_URL,
++        providers={"okta": okta},
++        allow=(AllowEntry("okta", Matcher.EVERYONE, None),),
++    )
++    async with client(sign_in=sign_in) as http:
++        assert_secured(await http.get("/api/agents"), 401)
++        bearer = {"authorization": "Bearer not-a-token"}
++        assert_secured(await http.get("/api/agents", headers=bearer), 401)
++        assert_secured(await http.get("/auth/login/not%20an%20id"), 302)
++        # Over plain http on loopback the session cookie has no ``__Host-`` prefix.
++        cross_site = {"cookie": "robinauts_session=x", "origin": "https://elsewhere.example.com"}
++        assert_secured(await http.post("/auth/logout", headers=cross_site), 403)
+-- 
+2.43.0
+
