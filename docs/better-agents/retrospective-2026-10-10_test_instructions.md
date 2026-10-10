@@ -13,7 +13,7 @@ tokens_control_session: "session_01EdaMv891NCzHKUE2B1MtSL (Opus 5.5, medium): in
 tokens_treatment_session: "session_01WSoiAd58tv7xx9VJhmGiyF (Opus 5.5, medium): input 5,186; output 101,256; cache read 20,062,800; cache write 789,741; cost $10.20"
 tokens_all_four_sessions: "output 582,992; cache read 86,226,579; cost $75.48"
 wall_clock: "16 h 50 min from the first message to this document, with idle gaps; the continuous stretch from the second review of PR 120 to this document was about 7 h 40 min"
-api_duration: "see the note at the end of the frontmatter"
+api_duration: "duration_api_ms summed over 33 turns: 16 h 05 min; duration_ms summed: 1 h 00 min; see the appendix"
 note: "Claude Code's /cost reports two durations: wall, above, and API, the time the model was actually generating across all turns. The session record does not aggregate the API figure; it was summed from the per-turn result events and is given in the last section of this document."
 related: "session-2026-10-10_test_instructions.md (the full log), prompts.md, runs.csv, audits/, patches/"
 ---
@@ -321,4 +321,11 @@ Claude Code reports two durations per session: wall clock, in the frontmatter, a
 API, the time the model was generating. The API figure for this session, summed
 from the per-turn result events after this document was drafted:
 
-Pending: being summed from the per-turn result events at the time of this push; a follow-up commit fills it in.
+Summed over the 33 turn results of this session (02:26 to 18:40 UTC), reading the
+harness's own fields: `duration_api_ms` totals 57,916,227 ms, which is 16 h 05 min,
+and `duration_ms` totals 3,626,659 ms, which is 1 h 00 min. The first figure is
+within 45 minutes of the wall clock, so in this harness it counts the whole turn,
+tool execution and waits included; the second is the per-turn tail the harness
+reports beside it. Two of the 33 turns ended in an error, both when a safety
+classifier stopped a response during the experiment setup. Compaction events in
+the transcript: 0, which confirms the frontmatter.
