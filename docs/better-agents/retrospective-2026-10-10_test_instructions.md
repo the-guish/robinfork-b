@@ -247,6 +247,75 @@ behavior implemented and untested. I wrote the task text: one sentence naming th
 behavior, "nothing tests that", "add a test for it and make sure it passes". No
 hint of where or how.
 
+He also decided how the runs would be organized, and the shape he asked for is
+worth drawing, because it is what made the experiment both quick and clean. Quick:
+one coordinator per arm, subagents in parallel, three first and seven more once the
+first three looked sane. Clean: the subagents never see anything but the task and
+the repository at a pinned commit, the coordinator never implements, and the two
+arms differ in exactly one file.
+
+```mermaid
+flowchart TB
+    H["Human developer, repository owner<br/>decides the design, creates the lab repo,<br/>starts the coordinator sessions from the web UI,<br/>approves, merges the PR, deletes branches"]
+
+    M["Master session (this document's author)<br/>claude-fable-5-1, effort xhigh<br/>context: the whole day, PRs, docs, its own errors<br/>writes the task text and the coordinator prompt,<br/>verifies every branch's parent, exports patches,<br/>audits transcripts, writes the log"]
+
+    P["Pilot session, created by the master session<br/>claude-opus-5-5, effort high<br/>asked a human to approve; one valid run,<br/>three contaminated by a stale origin/main<br/>(discarded, lesson: pin the base SHA)"]
+
+    subgraph C["Control arm: base d597506, no root instruction file"]
+        direction TB
+        CC["Coordinator<br/>claude-opus-5-5, effort medium<br/>context: the owner's prompt, nothing else<br/>fetches main, confirms the SHA, spawns,<br/>checks each parent, pushes unchanged, reports<br/>never implements, never adds a hint"]
+        CS["Subagents a to j, ten runs<br/>one isolated git worktree each<br/>context: the task text, the repository at d597506,<br/>the account-level skill<br/>explore, choose, write, make it pass, commit<br/>never push"]
+        CC -- "task text, verbatim" --> CS
+        CS -- "a branch each" --> CC
+    end
+
+    subgraph T["Treatment arm: base 39c26b2, root AGENTS.md + CLAUDE.md symlink"]
+        direction TB
+        TC["Coordinator<br/>claude-opus-5-5, effort medium<br/>context: the owner's prompt, nothing else<br/>same duties as the control coordinator"]
+        TS["Subagents a to j, ten runs<br/>one isolated git worktree each<br/>context: the task text, the repository at 39c26b2<br/>(so the root file is injected), the account-level skill<br/>never push"]
+        TC -- "task text, verbatim" --> TS
+        TS -- "a branch each" --> TC
+    end
+
+    H -- "asks, pushes back, decides" --> M
+    M -- "task text, prompt, PR #1, findings" --> H
+    M -. "created, then abandoned" .-> P
+    H -- "pastes the prompt as the first message<br/>(user standing, no approval loop)" --> CC
+    H -- "same prompt, new base SHA" --> TC
+    CC -- "compare/a to compare/j" --> G[("the-guish/robinfork-b<br/>branches and transcripts")]
+    TC -- "compare/a to compare/j" --> G
+    G -. "read-only: fetch, diff, audit" .-> M
+```
+
+Who was responsible for what:
+
+| Session | Started with | Did | Deliberately did not |
+|---|---|---|---|
+| Human developer | everything, including the goal | chose the vacuum design, created and rewrote the lab repo, pasted the prompts, approved the pilot's pushes, merged the treatment PR, deleted branches between arms | write code, tests or prompts for the subagents |
+| Master session | the whole day's conversation: both PRs, the strategy document, its own two wrong calls | wrote the one-sentence task and the coordinator prompt, created the pilot, verified every branch's parent commit, exported the commits as patches, ran the three transcript audits through its own subagents, wrote the log and this document | start the control or treatment sessions (a safety classifier stopped that; the owner started them), touch the lab repository while runs were in flight |
+| Coordinator, one per arm | the owner's prompt and a fresh checkout | fetched main and confirmed the SHA, spawned three then seven subagents with the task text verbatim in isolated worktrees, checked each branch's parent, pushed each branch unchanged, reported one line per branch | implement anything, summarize the repository for the subagents, add a hint, edit a subagent's work |
+| Subagents, ten per arm | the task text, the repository at the pinned commit, and the owner's account-level skill | explored, chose a placement, wrote the test, got it to pass, committed with a sign-off | push, read each other's work (they did share one machine and one PostgreSQL, which cost one passing test but no placement) |
+
+A note on why controlling the context of these sessions matters. The question
+being measured is "what does an agent do given only X". Everything in a session's
+context is part of X whether anyone meant it to be or not. My own session could
+not run the experiment, because by then its context held the strategy document,
+the PR 121 discussion and the words "the placement is `tests/api`"; anything
+spawned from it would have inherited the answer. The coordinator could not be
+allowed to look around the repository and summarize what it found, because a
+summary is a hint. The task had to be passed as bytes, not paraphrased. Even git
+state is context: in the pilot, a stale `origin/main` put an existing fast test in
+three subagents' trees, and all three wrote the real-server complement to it, which
+is the cleanest demonstration of contamination in the whole day. The two arms had
+to be identical in model, effort, prompt and base behavior so that the one file
+could be the only variable. The account-level skill that reaches every session was
+acceptable only because it reached both arms equally and carries no repository
+content. And the audits ask "what did the run read before its first write" for the
+same reason: the decision is made at that moment, with that context, and nothing
+read afterwards can explain it. If you cannot say exactly what a run knew when it
+decided, you have not measured the run; you have measured your leak.
+
 The pilot was mine to run and I got it half wrong. I created a session with
 Opus 5.5 at high effort, sent it the task as a message from my session, and asked
 it to spawn three subagents in isolated worktrees and do one run itself. The
