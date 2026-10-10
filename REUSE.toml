@@ -9,6 +9,7 @@ version = 1
 path = [
     "README.md",
     "CONTRIBUTING.md",
+    "AGENTS.md",
     "DEPENDENCIES.md",
     "SECURITY.md",
     "NOTICE",
